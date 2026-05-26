@@ -1,4 +1,4 @@
-Aegis Password Vault
+Aegis Password Vault,
 Aegis is a secure, local-first, end-to-end encrypted password manager built with Rust and egui.
 
 Features
