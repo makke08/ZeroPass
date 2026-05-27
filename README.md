@@ -39,4 +39,4 @@ Note: This application requires a valid master password to access your data. Do 
 If you get a warning that the app cannot be opened, click "Run Anyways". You may need to click "more info" to see this option.
 This warning is entirely harmless and only shows because the app is not signed. Signing it would cost me upwards of 300€/year.
 
-This app is made using artificial intelligence, but don't worry, it still works as it should and is still secure.
+This app is made using artificial intelligence, but don't worry, it still works as it should and your entries as still secure.
