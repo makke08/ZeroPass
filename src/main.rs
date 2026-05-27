@@ -1250,7 +1250,7 @@ impl VaultGui {
                                         );
                                         ui.add_space(8.0);
                                         ui.label(
-                                            egui::RichText::new("Fixed: ")
+                                            egui::RichText::new("Fixed: Light Mode.")
                                                 .size(13.0)
                                                 .color(fade_color(green, t1)),
                                         );
