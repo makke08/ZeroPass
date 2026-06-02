@@ -1,40 +1,102 @@
-Aegis Password Vault,
-Aegis is a secure, local-first, end-to-end encrypted password manager built with Rust and egui.
+# 🛡️ Aegis
 
-Features
-Security First: Uses XChaCha20-Poly1305 for authenticated encryption and Argon2id (KDF) to derive keys from your master password, ensuring your data is safe.
+A modern, local-first password manager built with Rust and egui.
 
-Local-Only: Your credentials remain on your machine; Aegis does not sync to the cloud.
+Aegis stores your passwords in an encrypted vault secured using Argon2id and XChaCha20-Poly1305. Everything is stored locally on your device—no cloud, no accounts, no subscriptions.
 
-Modern GUI: A polished, responsive interface built with egui, featuring:
+---
 
-Dark/Light mode support.
+## ✨ Features
 
-Smooth animations for a seamless user experience.
+- 🔐 Encrypted password vault
+- ⚡ Fast local storage
+- 🔑 Argon2id key derivation
+- 🛡️ XChaCha20-Poly1305 encryption
+- 📋 One-click password copying
+- ⏳ Automatic clipboard clearing
+- 🔍 Search entries instantly
+- 🎲 Built-in password generator
+- 🌙 Dark mode
+- 🔒 Auto-lock support
+- 🎨 Modern animated interface
 
-In-app toast notifications for actions.
+---
 
-Convenience:
+## 📸 Screenshots
 
-Secure clipboard management (with auto-clear functionality to keep your secrets private).
+Check the "screenshots" folder
+---
 
-Built-in password generator.
+## 🚀 Installation
 
-Searchable entry list.
+### Clone the repository
 
-Configurable: Adjust settings like auto-lock timeouts, clipboard clearing delays, and default password lengths to suit your workflow.
+```bash
+git clone https://github.com/makke08/Aegis.git
+cd Aegis
+```
 
-Security Architecture
-The vault is stored as a single, encrypted file (vault.json.enc) in your system's application data directory. Upon startup, the app prompts for your master password, which is then passed through the Argon2id KDF to unlock the vault. The master password is zeroized from memory immediately after use.
+### Build
 
-Getting Started
-Launch: Open the application.
+```bash
+cargo build --release
+```
 
-Setup: Choose a strong master password to initialize your new, encrypted vault.
+### Run
 
-Manage: Use the intuitive interface to add, view, and copy your credentials.
+```bash
+cargo run --release
+```
 
-Note: This application requires a valid master password to access your data. Do not lose your master password, as there is no way to recover it. It only works on Windows.
+---
 
-If you get a warning that the app cannot be opened, click "Run Anyways". You may need to click "more info" to see this option.
-This warning is entirely harmless and only shows because the app is not signed. Signing it would cost me upwards of 300€/year.
+## 🔐 Security
+
+Aegis uses:
+
+- Argon2id for key derivation
+- XChaCha20-Poly1305 authenticated encryption
+- Random cryptographic salts
+- Random cryptographic nonces
+- Automatic memory zeroization where possible
+
+All encryption and decryption happens locally on your machine.
+
+No data is sent to external servers.
+
+---
+
+## 📂 Vault Location
+
+Vault files are stored locally in the application's data directory.
+
+The vault can be copied to another device as long as the master password is known.
+
+---
+
+## 🛣️ Roadmap
+
+- [ ] TOTP authenticator support
+- [ ] Password health audit
+- [ ] Duplicate password detection
+- [ ] Categories & tags
+- [ ] Windows Hello support
+- [ ] Secure notes
+- [ ] Encrypted backups
+- [ ] Import/export support
+
+---
+
+## 🤝 Contributing
+
+Pull requests, bug reports, and feature suggestions are welcome.
+
+---
+
+## 📜 License
+
+MIT License
+
+---
+
+Built with ❤️ in Rust.
