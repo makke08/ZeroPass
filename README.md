@@ -2,7 +2,7 @@
 
 A modern, local-first password manager built with Rust and egui.
 
-Aegis stores your passwords in an encrypted vault secured using Argon2id and XChaCha20-Poly1305. Everything is stored locally on your device—no cloud, no accounts, no subscriptions.
+Aegis stores your passwords in an encrypted vault secured using Argon2id and XChaCha20-Poly1305. Everything is stored locally on your device - no cloud, no accounts, no subscriptions.
 
 ---
 
