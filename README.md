@@ -76,7 +76,7 @@ The vault can be copied to another device as long as the master password is know
 
 ## 🛣️ Roadmap
 
--  ✓ TOTP authenticator support
+  ✓ TOTP authenticator support
 - [ ] Password health audit
 - [ ] Duplicate password detection
 - [ ] Categories & tags
