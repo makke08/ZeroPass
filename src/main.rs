@@ -66,13 +66,105 @@ enum VaultError {
     Msg(String),
 }
 
-// --- Data Structures ---
+// --- TOTP Engine (RFC 6238 / RFC 4226) ---
+// Pure-std HMAC-SHA1 + base32 — no extra crates needed.
+
+fn totp_base32_decode(s: &str) -> Option<Vec<u8>> {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let s = s.trim().to_uppercase().replace(['=', ' ', '-'], "");
+    let mut bits: u64 = 0;
+    let mut bit_count: u32 = 0;
+    let mut out = Vec::new();
+    for ch in s.bytes() {
+        let val = alphabet.iter().position(|&b| b == ch)? as u64;
+        bits = (bits << 5) | val;
+        bit_count += 5;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            out.push(((bits >> bit_count) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
+    const BLOCK: usize = 64;
+    // Derive padded key
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let h = sha1(key);
+        k[..20].copy_from_slice(&h);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK { ipad[i] ^= k[i]; opad[i] ^= k[i]; }
+    let mut inner = Vec::with_capacity(BLOCK + msg.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(msg);
+    let inner_hash = sha1(&inner);
+    let mut outer = Vec::with_capacity(BLOCK + 20);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    sha1(&outer)
+}
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    // SHA-1 (FIPS 180-4)
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 { msg.push(0); }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 { w[i] = u32::from_be_bytes(chunk[i*4..i*4+4].try_into().unwrap()); }
+        for i in 16..80 { w[i] = (w[i-3]^w[i-8]^w[i-14]^w[i-16]).rotate_left(1); }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19  => ((b & c) | ((!b) & d),            0x5A827999u32),
+                20..=39 => (b ^ c ^ d,                       0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d),    0x8F1BBCDC),
+                _       => (b ^ c ^ d,                       0xCA62C1D6),
+            };
+            let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+            e = d; d = c; c = b.rotate_left(30); b = a; a = temp;
+        }
+        h[0]=h[0].wrapping_add(a); h[1]=h[1].wrapping_add(b);
+        h[2]=h[2].wrapping_add(c); h[3]=h[3].wrapping_add(d);
+        h[4]=h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for i in 0..5 { out[i*4..i*4+4].copy_from_slice(&h[i].to_be_bytes()); }
+    out
+}
+
+/// Returns (code, seconds_remaining) for a 30-second TOTP window, or None if secret is invalid.
+fn totp_now(secret_b32: &str) -> Option<(String, u64)> {
+    let key = totp_base32_decode(secret_b32)?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let counter = secs / 30;
+    let remaining = 30 - (secs % 30);
+    let msg = counter.to_be_bytes();
+    let mac = hmac_sha1(&key, &msg);
+    let offset = (mac[19] & 0x0F) as usize;
+    let code = u32::from_be_bytes(mac[offset..offset+4].try_into().unwrap()) & 0x7FFF_FFFF;
+    Some((format!("{:06}", code % 1_000_000), remaining))
+}
+
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Entry {
     id: String,
     service: String,
     username: String,
     password: String,
+    #[serde(default)]
+    totp_secret: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -286,8 +378,8 @@ enum UnlockResult {
 enum Modal {
     #[default]
     None,
-    AddEntry { service: String, username: String, password: String, password_length: f32 },
-    EditEntry { original_id: String, service: String, username: String, password: String },
+    AddEntry { service: String, username: String, password: String, password_length: f32, totp_secret: String },
+    EditEntry { original_id: String, service: String, username: String, password: String, totp_secret: String },
     ChangePassword { old: String, new: String, confirm: String },
     DeleteVault { confirmation: String },
     Settings { 
@@ -370,6 +462,14 @@ struct VaultGui {
 
     #[zeroize(skip)]
     view_opened: Option<Instant>,
+
+    // Drag-to-reorder state
+    #[zeroize(skip)]
+    drag_source_idx: Option<usize>,
+    #[zeroize(skip)]
+    drag_target_idx: Option<usize>,
+    #[zeroize(skip)]
+    drag_pointer_y: f32,
 }
 
 impl VaultGui {
@@ -401,6 +501,9 @@ impl VaultGui {
             toasts: Vec::new(),
             info_page_opened: None,
             view_opened: Some(Instant::now()),
+            drag_source_idx: None,
+            drag_target_idx: None,
+            drag_pointer_y: 0.0,
         }
     }
 
@@ -488,7 +591,7 @@ impl VaultGui {
         self.search_query.clear();
     }
 
-    fn add_entry_and_save(&mut self, service: String, username: String, password: String) {
+    fn add_entry_and_save(&mut self, service: String, username: String, password: String, totp_secret: Option<String>) {
         if service.is_empty() || username.is_empty() {
             self.push_toast("Service and username are required".into(), ToastKind::Error);
             return;
@@ -498,6 +601,7 @@ impl VaultGui {
             service: service.trim().to_string(),
             username: username.trim().to_string(),
             password,
+            totp_secret,
         };
         self.vault.entries.push(entry);
         
@@ -591,21 +695,21 @@ impl VaultGui {
             self.draw_loading_spinner(ui, start_time.elapsed().as_secs_f32());
             ui.add_space(40.0);
             ui.label(egui::RichText::new(title).size(18.0)
-                .color(if dm { egui::Color32::from_rgb(235, 235, 245) } else { egui::Color32::from_rgb(20, 20, 35) }));
+                .color(if dm { egui::Color32::from_rgb(235, 235, 245) } else { egui::Color32::from_rgb(22, 19, 14) }));
             ui.add_space(8.0);
             ui.label(egui::RichText::new(subtitle).size(13.0)
-                .color(if dm { egui::Color32::from_rgb(165, 165, 185) } else { egui::Color32::from_rgb(95, 95, 115) }));
+                .color(if dm { egui::Color32::from_rgb(165, 165, 185) } else { egui::Color32::from_rgb(100, 94, 82) }));
         });
     }
 
     fn draw_locked_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let dm = self.dark_mode;
         let accent   = egui::Color32::from_rgb(99, 111, 245);
-        let c_title  = if dm { egui::Color32::from_rgb(232, 232, 245) } else { egui::Color32::from_rgb(18, 18, 34) };
-        let c_sub    = if dm { egui::Color32::from_rgb(155, 158, 182) } else { egui::Color32::from_rgb(105, 105, 125) };
-        let c_card   = if dm { egui::Color32::from_rgb(26, 29, 42) } else { egui::Color32::from_rgb(255, 255, 255) };
-        let c_border = if dm { egui::Color32::from_rgb(58, 64, 92)  } else { egui::Color32::from_rgb(212, 212, 232) };
-        let c_input  = if dm { egui::Color32::from_rgb(13, 14, 21)  } else { egui::Color32::from_rgb(244, 244, 252) };
+        let c_title  = if dm { egui::Color32::from_rgb(232, 232, 245) } else { egui::Color32::from_rgb(22, 19, 14) };
+        let c_sub    = if dm { egui::Color32::from_rgb(155, 158, 182) } else { egui::Color32::from_rgb(100, 94, 82) };
+        let c_card   = if dm { egui::Color32::from_rgb(26, 29, 42) } else { egui::Color32::from_rgb(252, 250, 247) };
+        let c_border = if dm { egui::Color32::from_rgb(58, 64, 92)  } else { egui::Color32::from_rgb(208, 204, 196) };
+        let c_input  = if dm { egui::Color32::from_rgb(13, 14, 21)  } else { egui::Color32::from_rgb(242, 240, 236) };
 
         // Animation
         const ANIM_DUR: f32 = 0.45;
@@ -629,7 +733,7 @@ impl VaultGui {
             let icon_bg = if dm {
                 egui::Color32::from_rgb(32, 36, 62)
             } else {
-                egui::Color32::from_rgb(232, 232, 252)
+                egui::Color32::from_rgb(228, 225, 218)
             };
             egui::Frame::none()
                 .fill(fc(icon_bg, t0))
@@ -659,7 +763,7 @@ impl VaultGui {
             card.show(ui, |ui| {
                 ui.set_min_width(300.0);
 
-                let lbl_color = if dm { egui::Color32::from_rgb(175, 178, 205) } else { egui::Color32::from_rgb(80, 80, 100) };
+                let lbl_color = if dm { egui::Color32::from_rgb(175, 178, 205) } else { egui::Color32::from_rgb(72, 66, 55) };
                 ui.label(egui::RichText::new("Master Password").size(11.5).color(fc(lbl_color, t1)));
                 ui.add_space(5.0);
 
@@ -735,11 +839,11 @@ impl VaultGui {
     fn draw_no_vault_view(&mut self, ui: &mut egui::Ui) {
         let dm = self.dark_mode;
         let accent   = egui::Color32::from_rgb(99, 111, 245);
-        let c_title  = if dm { egui::Color32::from_rgb(232, 232, 245) } else { egui::Color32::from_rgb(18, 18, 34) };
-        let c_sub    = if dm { egui::Color32::from_rgb(160, 162, 185) } else { egui::Color32::from_rgb(100, 100, 122) };
-        let c_card   = if dm { egui::Color32::from_rgb(28, 31, 44) } else { egui::Color32::from_rgb(255, 255, 255) };
-        let c_border = if dm { egui::Color32::from_rgb(62, 68, 95)  } else { egui::Color32::from_rgb(210, 210, 230) };
-        let c_input  = if dm { egui::Color32::from_rgb(13, 14, 21)  } else { egui::Color32::from_rgb(244, 244, 252) };
+        let c_title  = if dm { egui::Color32::from_rgb(232, 232, 245) } else { egui::Color32::from_rgb(22, 19, 14) };
+        let c_sub    = if dm { egui::Color32::from_rgb(160, 162, 185) } else { egui::Color32::from_rgb(100, 94, 82) };
+        let c_card   = if dm { egui::Color32::from_rgb(28, 31, 44) } else { egui::Color32::from_rgb(252, 250, 247) };
+        let c_border = if dm { egui::Color32::from_rgb(62, 68, 95)  } else { egui::Color32::from_rgb(205, 200, 192) };
+        let c_input  = if dm { egui::Color32::from_rgb(13, 14, 21)  } else { egui::Color32::from_rgb(242, 240, 236) };
 
         // Animation
         const ANIM_DUR: f32 = 0.45;
@@ -760,7 +864,7 @@ impl VaultGui {
             ui.add_space(50.0 + SLIDE_PX * (1.0 - t0));
 
             let icon_frame = egui::Frame::none()
-                .fill(fc(if dm { egui::Color32::from_rgb(40, 44, 58) } else { egui::Color32::from_rgb(238, 238, 252) }, t0))
+                .fill(fc(if dm { egui::Color32::from_rgb(40, 44, 58) } else { egui::Color32::from_rgb(235, 232, 226) }, t0))
                 .rounding(22.0)
                 .inner_margin(egui::Margin::symmetric(22.0, 18.0))
                 .stroke(egui::Stroke::new(1.5, fc(accent, t0)));
@@ -783,15 +887,15 @@ impl VaultGui {
                 ui.add_space(20.0);
                 for (icon, label) in [("🔐", "End-to-end encrypted"), ("⚡", "Fast & local"), ("🔑", "Argon2id KDF")] {
                     let pill = egui::Frame::none()
-                        .fill(fc(if dm { egui::Color32::from_rgb(42, 47, 63) } else { egui::Color32::from_rgb(238, 238, 252) }, t1))
+                        .fill(fc(if dm { egui::Color32::from_rgb(42, 47, 63) } else { egui::Color32::from_rgb(235, 232, 226) }, t1))
                         .rounding(20.0)
                         .inner_margin(egui::Margin::symmetric(10.0, 5.0))
-                        .stroke(egui::Stroke::new(1.0, fc(if dm { egui::Color32::from_rgb(75, 82, 108) } else { egui::Color32::from_rgb(205, 205, 228) }, t1)));
+                        .stroke(egui::Stroke::new(1.0, fc(if dm { egui::Color32::from_rgb(75, 82, 108) } else { egui::Color32::from_rgb(200, 195, 186) }, t1)));
                     pill.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let pill_icon_col = if dm { egui::Color32::WHITE } else { egui::Color32::from_rgb(88, 101, 242) };
                             ui.label(egui::RichText::new(icon).size(12.0).color(fc(pill_icon_col, t1)));
-                            ui.label(egui::RichText::new(label).size(11.0).color(fc(if dm { egui::Color32::from_rgb(185, 185, 210) } else { egui::Color32::from_rgb(80, 80, 105) }, t1)));
+                            ui.label(egui::RichText::new(label).size(11.0).color(fc(if dm { egui::Color32::from_rgb(185, 185, 210) } else { egui::Color32::from_rgb(72, 66, 55) }, t1)));
                         });
                     });
                     ui.add_space(4.0);
@@ -813,7 +917,7 @@ impl VaultGui {
             card.show(ui, |ui| {
                 ui.set_min_width(320.0);
 
-                let lbl_color = if dm { egui::Color32::from_rgb(190, 190, 210) } else { egui::Color32::from_rgb(75, 75, 95) };
+                let lbl_color = if dm { egui::Color32::from_rgb(190, 190, 210) } else { egui::Color32::from_rgb(72, 66, 55) };
                 ui.label(egui::RichText::new("✨  Choose a Master Password").size(12.0).color(fc(lbl_color, t2)));
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("This password encrypts everything — don't lose it.").size(11.0).color(fc(c_sub, t2)));
@@ -836,7 +940,7 @@ impl VaultGui {
 
                 let is_valid = !self.master_password.is_empty();
                 let btn_fill = if is_valid { accent } else {
-                    if dm { egui::Color32::from_rgb(50, 54, 68) } else { egui::Color32::from_rgb(200, 200, 215) }
+                    if dm { egui::Color32::from_rgb(50, 54, 68) } else { egui::Color32::from_rgb(194, 189, 180) }
                 };
 
                 ui.horizontal(|ui| {
@@ -861,13 +965,13 @@ impl VaultGui {
         let dm = self.dark_mode;
         let accent    = egui::Color32::from_rgb(99, 111, 245);
         let green     = egui::Color32::from_rgb(55, 168, 90);
-        let c_title   = if dm { egui::Color32::from_rgb(232, 232, 245) } else { egui::Color32::from_rgb(14, 14, 26) };
-        let c_sub     = if dm { egui::Color32::from_rgb(160, 162, 185) } else { egui::Color32::from_rgb(95, 95, 115) };
-        let c_card    = if dm { egui::Color32::from_rgb(28, 31, 44)  } else { egui::Color32::from_rgb(255, 255, 255) };
-        let c_border  = if dm { egui::Color32::from_rgb(62, 68, 95)  } else { egui::Color32::from_rgb(218, 218, 232) };
-        let c_input   = if dm { egui::Color32::from_rgb(13, 14, 21)  } else { egui::Color32::from_rgb(245, 245, 250) };
+        let c_title   = if dm { egui::Color32::from_rgb(232, 232, 245) } else { egui::Color32::from_rgb(22, 19, 14) };
+        let c_sub     = if dm { egui::Color32::from_rgb(160, 162, 185) } else { egui::Color32::from_rgb(100, 94, 82) };
+        let c_card    = if dm { egui::Color32::from_rgb(28, 31, 44)  } else { egui::Color32::from_rgb(252, 250, 247) };
+        let c_border  = if dm { egui::Color32::from_rgb(62, 68, 95)  } else { egui::Color32::from_rgb(210, 206, 198) };
+        let c_input   = if dm { egui::Color32::from_rgb(13, 14, 21)  } else { egui::Color32::from_rgb(242, 240, 236) };
         let c_icon_bg = if dm { egui::Color32::from_rgb(48, 52, 72)  } else { egui::Color32::from_rgb(236, 236, 252) };
-        let c_icon_st = if dm { egui::Color32::from_rgb(78, 85, 115) } else { egui::Color32::from_rgb(200, 200, 228) };
+        let c_icon_st = if dm { egui::Color32::from_rgb(78, 85, 115) } else { egui::Color32::from_rgb(196, 190, 180) };
 
         // Animation — bar + search slide in as one block, entries stagger per-card
         const ANIM_DUR: f32 = 0.40;
@@ -895,7 +999,7 @@ impl VaultGui {
                 ui.label(egui::RichText::new("🔐  Passwords").size(14.0).strong().color(fc(c_title, t_bar)));
                 ui.add_space(6.0);
                 let count = self.vault.entries.len();
-                let badge_bg = if dm { egui::Color32::from_rgb(55, 62, 92) } else { egui::Color32::from_rgb(228, 228, 252) };
+                let badge_bg = if dm { egui::Color32::from_rgb(55, 62, 92) } else { egui::Color32::from_rgb(228, 225, 218) };
                 let badge_txt = if dm { egui::Color32::from_rgb(190, 195, 235) } else { accent };
                 let badge = egui::Frame::none()
                     .fill(fc(badge_bg, t_bar))
@@ -914,12 +1018,13 @@ impl VaultGui {
                         self.modal = Modal::AddEntry {
                             service: String::new(), username: String::new(),
                             password: String::new(), password_length: self.default_password_length as f32,
+                            totp_secret: String::new(),
                         };
                     }
 
                     ui.add_space(8.0);
                     let cur = ui.cursor();
-                    let sep = fc(if dm { egui::Color32::from_rgb(58, 64, 90) } else { egui::Color32::from_rgb(215, 215, 232) }, t_bar);
+                    let sep = fc(if dm { egui::Color32::from_rgb(58, 64, 90) } else { egui::Color32::from_rgb(210, 206, 198) }, t_bar);
                     ui.painter().vline(cur.left(), cur.y_range(), egui::Stroke::new(1.0, sep));
                     ui.add_space(8.0);
 
@@ -932,7 +1037,7 @@ impl VaultGui {
 
                     ui.add_space(4.0);
 
-                    let icon_text_col = if dm { egui::Color32::from_rgb(210, 212, 235) } else { egui::Color32::from_rgb(60, 62, 95) };
+                    let icon_text_col = if dm { egui::Color32::from_rgb(210, 212, 235) } else { egui::Color32::from_rgb(56, 50, 40) };
                     let settings_btn = egui::Button::new(egui::RichText::new("⚙️").size(14.0).color(fc(icon_text_col, t_bar)))
                         .fill(fc(c_icon_bg, t_bar)).stroke(egui::Stroke::new(1.0, fc(c_icon_st, t_bar)))
                         .rounding(8.0).min_size(egui::vec2(34.0, 34.0));
@@ -970,21 +1075,24 @@ impl VaultGui {
 
         ui.add_space(14.0);
 
-        // ── ENTRIES LIST — each card staggered ──
+        // ── ENTRIES LIST — each card staggered, with drag-to-reorder ──
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             let mut to_remove_id: Option<String> = None;
             let search_lower = self.search_query.to_lowercase();
+            let is_searching = !search_lower.is_empty();
 
-            let filtered_entries: Vec<Entry> = self.vault.entries.iter()
-                .filter(|e| {
+            // Build an index list of matching entries in the vault (we keep vault indices for reordering)
+            let filtered_indices: Vec<usize> = self.vault.entries.iter()
+                .enumerate()
+                .filter(|(_, e)| {
                     search_lower.is_empty()
                     || e.service.to_lowercase().contains(&search_lower)
                     || e.username.to_lowercase().contains(&search_lower)
                 })
-                .cloned()
+                .map(|(i, _)| i)
                 .collect();
 
-            if filtered_entries.is_empty() {
+            if filtered_indices.is_empty() {
                 let t_empty = anim_t(0.12);
                 ui.add_space(SLIDE_PX * (1.0 - t_empty));
                 ui.vertical_centered(|ui| {
@@ -996,50 +1104,180 @@ impl VaultGui {
                     if !self.search_query.is_empty() {
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("Try a different search term").size(12.0)
-                            .color(fc(if dm { egui::Color32::from_rgb(115, 115, 138) } else { egui::Color32::from_rgb(145, 145, 165) }, t_empty)));
+                            .color(fc(if dm { egui::Color32::from_rgb(115, 115, 138) } else { egui::Color32::from_rgb(130, 124, 112) }, t_empty)));
                     }
                 });
             }
 
-            for (i, entry) in filtered_entries.iter().enumerate() {
-                // Each card staggers by 0.04s per index, starting at 0.12s
-                let t_card = anim_t(0.12 + i as f32 * 0.04);
+            // Update pointer Y every frame while dragging
+            if self.drag_source_idx.is_some() {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    self.drag_pointer_y = pos.y;
+                }
+                // Reset target each frame so we re-pick the best one below
+                self.drag_target_idx = None;
+                ui.ctx().request_repaint();
+            }
+
+            let mut drop_happened = false;
+
+            for (list_pos, &vault_idx) in filtered_indices.iter().enumerate() {
+                let entry = self.vault.entries[vault_idx].clone();
+
+                let t_card = anim_t(0.12 + list_pos as f32 * 0.04);
                 ui.add_space(SLIDE_PX * (1.0 - t_card));
 
+                // Determine visual state for this card
+                let is_dragged = self.drag_source_idx == Some(vault_idx);
+                let is_drop_target = !is_dragged && self.drag_source_idx.is_some()
+                    && self.drag_target_idx == Some(vault_idx);
+
+                // Card border/fill highlight while dragging
+                let card_fill = if is_dragged {
+                    if dm { egui::Color32::from_rgb(38, 42, 62) } else { egui::Color32::from_rgb(244, 242, 255) }
+                } else {
+                    c_card
+                };
+                let card_border = if is_dragged { accent } else { c_border };
+                let card_border_width = if is_dragged { 2.0 } else { 1.0 };
+
+                // Draw a blue line above this card when it is the drop target
+                if is_drop_target {
+                    let cursor = ui.cursor();
+                    let line_y = cursor.top() - 2.0;
+                    let x_range = egui::Rangef::new(
+                        ui.available_rect_before_wrap().left(),
+                        ui.available_rect_before_wrap().right(),
+                    );
+                    ui.painter().hline(x_range, line_y, egui::Stroke::new(2.5, accent));
+                }
+
+                // Slightly fade and raise (via alpha) the card being dragged
+                let alpha_mult = if is_dragged { 0.6 } else { 1.0 };
+                let fc_a = |base: egui::Color32, t: f32| -> egui::Color32 {
+                    egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), (t * 255.0 * alpha_mult) as u8)
+                };
+
                 let card = egui::Frame::none()
-                    .fill(fc(c_card, t_card))
+                    .fill(fc_a(card_fill, t_card))
                     .rounding(12.0)
                     .inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 12.0, bottom: 12.0 })
-                    .stroke(egui::Stroke::new(1.0, fc(c_border, t_card)));
+                    .stroke(egui::Stroke::new(card_border_width, fc_a(card_border, t_card)));
 
-                card.show(ui, |ui| {
+                let card_resp = card.show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        // ── Grip handle ──
+                        if !is_searching {
+                            let handle_col = if is_dragged {
+                                fc_a(accent, t_card)
+                            } else {
+                                fc_a(if dm { egui::Color32::from_rgb(75, 82, 115) } else { egui::Color32::from_rgb(195, 190, 180) }, t_card)
+                            };
+                            let (handle_rect, handle_resp) = ui.allocate_exact_size(
+                                egui::vec2(10.0, 40.0),
+                                egui::Sense::drag(),
+                            );
+                            // 3×2 grid of small dots
+                            let cx = handle_rect.center().x;
+                            for row in 0..3 {
+                                let y = handle_rect.top() + 11.0 + row as f32 * 7.0;
+                                for col in 0..2 {
+                                    let x = cx - 2.0 + col as f32 * 4.0;
+                                    ui.painter().circle_filled(egui::pos2(x, y), 1.1, handle_col);
+                                }
+                            }
+                            ui.add_space(8.0);
+
+                            if handle_resp.drag_started() {
+                                self.drag_source_idx = Some(vault_idx);
+                                self.drag_pointer_y = ui.input(|i| i.pointer.hover_pos().map(|p| p.y).unwrap_or(0.0));
+                            }
+                            if handle_resp.drag_released() && self.drag_source_idx.is_some() {
+                                drop_happened = true;
+                            }
+                            if handle_resp.hovered() || handle_resp.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                            }
+                        }
+
                         let first_char = entry.service.chars().next().unwrap_or('?').to_uppercase().to_string();
                         let icon_size = 40.0;
                         let rect = ui.available_rect_before_wrap();
                         let center = egui::pos2(rect.left() + icon_size / 2.0, rect.top() + icon_size / 2.0);
-                        // Subtle drop shadow
                         ui.painter().circle_filled(
                             egui::pos2(center.x + 1.5, center.y + 2.0),
                             icon_size / 2.0,
                             egui::Color32::from_rgba_premultiplied(0, 0, 0, if dm { 45 } else { 18 }),
                         );
-                        ui.painter().circle_filled(center, icon_size / 2.0, fc(accent, t_card));
+                        ui.painter().circle_filled(center, icon_size / 2.0, fc_a(accent, t_card));
                         ui.painter().text(
                             center, egui::Align2::CENTER_CENTER, &first_char,
-                            egui::FontId::proportional(16.0), fc(egui::Color32::WHITE, t_card),
+                            egui::FontId::proportional(16.0), fc_a(egui::Color32::WHITE, t_card),
                         );
                         ui.add_space(icon_size + 10.0);
 
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(&entry.service).size(14.0).strong().color(fc(c_title, t_card)));
+                            ui.label(egui::RichText::new(&entry.service).size(14.0).strong().color(fc_a(c_title, t_card)));
                             ui.add_space(1.0);
-                            ui.label(egui::RichText::new(&entry.username).size(11.5).color(fc(c_sub, t_card)));
+                            ui.label(egui::RichText::new(&entry.username).size(11.5).color(fc_a(c_sub, t_card)));
                             if self.show_passwords {
                                 ui.add_space(2.0);
                                 ui.label(egui::RichText::new(&entry.password).size(10.5)
-                                    .color(fc(if dm { egui::Color32::from_rgb(120, 195, 120) } else { egui::Color32::from_rgb(35, 128, 58) }, t_card))
+                                    .color(fc_a(if dm { egui::Color32::from_rgb(120, 195, 120) } else { egui::Color32::from_rgb(35, 128, 58) }, t_card))
                                     .monospace());
+                            }
+                            // TOTP live code
+                            if let Some(ref secret) = entry.totp_secret {
+                                if let Some((code, secs)) = totp_now(secret) {
+                                    ui.add_space(4.0);
+                                    let totp_col = fc_a(egui::Color32::from_rgb(120, 160, 255), t_card);
+                                    let countdown_col = fc_a(if secs <= 5 {
+                                        egui::Color32::from_rgb(230, 100, 80)
+                                    } else {
+                                        c_sub
+                                    }, t_card);
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("🔒").size(11.0));
+                                        ui.add_space(3.0);
+                                        let code_btn = egui::Button::new(
+                                            egui::RichText::new(&code).size(13.0).strong().monospace().color(totp_col)
+                                        )
+                                        .fill(egui::Color32::TRANSPARENT)
+                                        .stroke(egui::Stroke::NONE)
+                                        .rounding(4.0);
+                                        if ui.add(code_btn).on_hover_text("Click to copy TOTP code").clicked() {
+                                            self.copy_to_clipboard(code.clone(), entry.service.clone());
+                                        }
+                                        // Countdown ring drawn manually
+                                        let (ring_rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 18.0), egui::Sense::hover());
+                                        let rc = ring_rect.center();
+                                        let r = 7.0_f32;
+                                        let progress = secs as f32 / 30.0;
+                                        // Background ring
+                                        ui.painter().circle_stroke(rc, r, egui::Stroke::new(2.0, fc_a(c_border, t_card)));
+                                        // Foreground arc — approximate with line segments
+                                        let arc_col = if secs <= 5 {
+                                            fc_a(egui::Color32::from_rgb(230, 100, 80), t_card)
+                                        } else {
+                                            fc_a(egui::Color32::from_rgb(120, 160, 255), t_card)
+                                        };
+                                        let segments = 32;
+                                        let sweep = progress * std::f32::consts::TAU;
+                                        let start = -std::f32::consts::FRAC_PI_2;
+                                        let mut prev = egui::pos2(rc.x + r * start.cos(), rc.y + r * start.sin());
+                                        for i in 1..=segments {
+                                            let frac = i as f32 / segments as f32;
+                                            if frac > progress { break; }
+                                            let angle = start + frac * std::f32::consts::TAU;
+                                            let next = egui::pos2(rc.x + r * angle.cos(), rc.y + r * angle.sin());
+                                            ui.painter().line_segment([prev, next], egui::Stroke::new(2.0, arc_col));
+                                            prev = next;
+                                        }
+                                        ui.add_space(2.0);
+                                        ui.label(egui::RichText::new(format!("{}s", secs)).size(10.5).color(countdown_col));
+                                    });
+                                    ui.ctx().request_repaint_after(Duration::from_secs(1));
+                                }
                             }
                         });
 
@@ -1047,10 +1285,10 @@ impl VaultGui {
                             let del_col = if dm { egui::Color32::from_rgb(215, 70, 70) } else { egui::Color32::from_rgb(200, 55, 55) };
                             let del_bg  = if dm { egui::Color32::TRANSPARENT } else { egui::Color32::from_rgb(255, 245, 245) };
                             let del_btn = egui::Button::new(
-                                egui::RichText::new("🗑️").size(13.0).color(fc(del_col, t_card))
+                                egui::RichText::new("🗑️").size(13.0).color(fc_a(del_col, t_card))
                             )
-                            .fill(fc(del_bg, t_card))
-                            .stroke(egui::Stroke::new(1.0, fc(egui::Color32::from_rgb(195, 58, 58), t_card)))
+                            .fill(fc_a(del_bg, t_card))
+                            .stroke(egui::Stroke::new(1.0, fc_a(egui::Color32::from_rgb(195, 58, 58), t_card)))
                             .rounding(8.0).min_size(egui::vec2(32.0, 32.0));
                             if ui.add(del_btn).on_hover_text("Delete entry").clicked() {
                                 to_remove_id = Some(entry.id.clone());
@@ -1058,9 +1296,9 @@ impl VaultGui {
 
                             ui.add_space(4.0);
 
-                            let edit_icon_col = if dm { egui::Color32::from_rgb(205, 208, 232) } else { egui::Color32::from_rgb(60, 62, 95) };
-                            let edit_btn = egui::Button::new(egui::RichText::new("✏️").size(13.0).color(fc(edit_icon_col, t_card)))
-                                .fill(fc(c_icon_bg, t_card)).stroke(egui::Stroke::new(1.0, fc(c_icon_st, t_card)))
+                            let edit_icon_col = if dm { egui::Color32::from_rgb(205, 208, 232) } else { egui::Color32::from_rgb(56, 50, 40) };
+                            let edit_btn = egui::Button::new(egui::RichText::new("✏️").size(13.0).color(fc_a(edit_icon_col, t_card)))
+                                .fill(fc_a(c_icon_bg, t_card)).stroke(egui::Stroke::new(1.0, fc_a(c_icon_st, t_card)))
                                 .rounding(8.0).min_size(egui::vec2(32.0, 32.0));
                             if ui.add(edit_btn).on_hover_text("Edit entry").clicked() {
                                 self.modal = Modal::EditEntry {
@@ -1068,14 +1306,15 @@ impl VaultGui {
                                     service: entry.service.clone(),
                                     username: entry.username.clone(),
                                     password: entry.password.clone(),
+                                    totp_secret: entry.totp_secret.clone().unwrap_or_default(),
                                 };
                             }
 
                             ui.add_space(4.0);
 
                             let copy_bg = if dm { egui::Color32::from_rgb(38, 105, 52) } else { egui::Color32::from_rgb(46, 158, 78) };
-                            let copy_btn = egui::Button::new(egui::RichText::new("📋").size(13.0).color(fc(egui::Color32::WHITE, t_card)))
-                                .fill(fc(copy_bg, t_card)).rounding(8.0).min_size(egui::vec2(32.0, 32.0));
+                            let copy_btn = egui::Button::new(egui::RichText::new("📋").size(13.0).color(fc_a(egui::Color32::WHITE, t_card)))
+                                .fill(fc_a(copy_bg, t_card)).rounding(8.0).min_size(egui::vec2(32.0, 32.0));
                             if ui.add(copy_btn).on_hover_text("Copy password").clicked() {
                                 self.copy_to_clipboard(entry.password.clone(), entry.service.clone());
                             }
@@ -1083,7 +1322,58 @@ impl VaultGui {
                     });
                 });
 
+                if let Some(src) = self.drag_source_idx {
+                    if src != vault_idx {
+                        let card_rect = card_resp.response.rect;
+                        let card_mid_y = card_rect.center().y;
+                        // "Insert before this card" when pointer is above its midpoint.
+                        // Because we reset drag_target_idx before the loop and iterate
+                        // top-to-bottom, the first time this triggers we record the target
+                        // (and don't overwrite again thanks to the is_none() guard).
+                        if self.drag_pointer_y <= card_mid_y && self.drag_target_idx.is_none() {
+                            self.drag_target_idx = Some(vault_idx);
+                        }
+                        // When the pointer is below ALL card midpoints, fall through to the
+                        // "insert at end" fallback after the loop.
+                    }
+                }
+
                 ui.add_space(if self.compact_view { 4.0 } else { 8.0 });
+            }
+
+            // "Insert at end" — pointer is below all card midpoints; use usize::MAX as sentinel
+            if self.drag_source_idx.is_some() && self.drag_target_idx.is_none() && !filtered_indices.is_empty() {
+                self.drag_target_idx = Some(usize::MAX);
+                // Draw the drop line at the very bottom of the list
+                let cursor = ui.cursor();
+                let line_y = cursor.top() - 2.0;
+                let x_range = egui::Rangef::new(
+                    ui.available_rect_before_wrap().left(),
+                    ui.available_rect_before_wrap().right(),
+                );
+                ui.painter().hline(x_range, line_y, egui::Stroke::new(2.5, accent));
+            }
+
+            // ── Commit drop ──
+            if drop_happened {
+                if let Some(src_vault_idx) = self.drag_source_idx {
+                    let n = self.vault.entries.len();
+                    if src_vault_idx < n {
+                        let tgt = self.drag_target_idx.unwrap_or(usize::MAX);
+                        if tgt == usize::MAX {
+                            // Move to end
+                            let entry = self.vault.entries.remove(src_vault_idx);
+                            self.vault.entries.push(entry);
+                        } else if tgt < n && tgt != src_vault_idx {
+                            let entry = self.vault.entries.remove(src_vault_idx);
+                            let insert_at = if tgt > src_vault_idx { tgt - 1 } else { tgt };
+                            self.vault.entries.insert(insert_at, entry);
+                        }
+                        self.save_after_change();
+                    }
+                }
+                self.drag_source_idx = None;
+                self.drag_target_idx = None;
             }
 
             if let Some(id) = to_remove_id {
@@ -1096,11 +1386,11 @@ impl VaultGui {
     fn draw_known_bugs_view(&mut self, ui: &mut egui::Ui) {
         let dm = self.dark_mode;
         let accent    = egui::Color32::from_rgb(99, 111, 245);
-        let c_title   = if dm { egui::Color32::from_rgb(225, 225, 240) } else { egui::Color32::from_rgb(20, 20, 36) };
-        let c_sub     = if dm { egui::Color32::from_rgb(148, 151, 175) } else { egui::Color32::from_rgb(108, 108, 130) };
-        let c_card    = if dm { egui::Color32::from_rgb(26, 28, 42) } else { egui::Color32::from_rgb(255, 255, 255) };
-        let c_border  = if dm { egui::Color32::from_rgb(55, 60, 88) } else { egui::Color32::from_rgb(215, 215, 235) };
-        let c_row     = if dm { egui::Color32::from_rgb(20, 22, 34) } else { egui::Color32::from_rgb(246, 246, 252) };
+        let c_title   = if dm { egui::Color32::from_rgb(225, 225, 240) } else { egui::Color32::from_rgb(22, 19, 14) };
+        let c_sub     = if dm { egui::Color32::from_rgb(148, 151, 175) } else { egui::Color32::from_rgb(100, 94, 82) };
+        let c_card    = if dm { egui::Color32::from_rgb(26, 28, 42) } else { egui::Color32::from_rgb(252, 250, 247) };
+        let c_border  = if dm { egui::Color32::from_rgb(55, 60, 88) } else { egui::Color32::from_rgb(208, 204, 196) };
+        let c_row     = if dm { egui::Color32::from_rgb(20, 22, 34) } else { egui::Color32::from_rgb(245, 243, 239) };
         let green     = egui::Color32::from_rgb(72, 199, 116);
         let green_bg  = if dm { egui::Color32::from_rgb(14, 38, 22) } else { egui::Color32::from_rgb(236, 255, 244) };
         let green_bdr = egui::Color32::from_rgb(45, 148, 76);
@@ -1213,7 +1503,7 @@ impl VaultGui {
                                     ))
                                     .show(ui, |ui| {
                                         ui.label(
-                                            egui::RichText::new("v1.0.5")
+                                            egui::RichText::new("v1.0.6")
                                                 .size(13.0)
                                                 .strong()
                                                 .color(fade_color(accent, t1)),
@@ -1221,7 +1511,7 @@ impl VaultGui {
                                     });
                                 ui.add_space(8.0);
                                 ui.label(
-                                    egui::RichText::new("2026-05-28")
+                                    egui::RichText::new("2026-06-11")
                                         .size(13.0)
                                         .color(fade_color(c_sub, t1)),
                                 );
@@ -1250,7 +1540,7 @@ impl VaultGui {
                                         );
                                         ui.add_space(8.0);
                                         ui.label(
-                                            egui::RichText::new("Fixed: Light Mode.")
+                                            egui::RichText::new("Fixed: ")
                                                 .size(13.0)
                                                 .color(fade_color(green, t1)),
                                         );
@@ -1331,7 +1621,7 @@ impl VaultGui {
                             .rounding(8.0)
                             .min_size(egui::vec2(ui.available_width(), 34.0));
                             if ui.add(discord_btn).clicked() {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab("https://discord.gg/hhbuwAmYgW"));
+                                ui.ctx().open_url(egui::OpenUrl::new_tab("https://discord.gg/NyFf8DWmVs"));
                             }
 
                             ui.add_space(12.0);
@@ -1432,7 +1722,7 @@ impl VaultGui {
                             let path_bg = if dm {
                                 egui::Color32::from_rgba_unmultiplied(13, 14, 21, (t3 * 255.0) as u8)
                             } else {
-                                egui::Color32::from_rgba_unmultiplied(244, 244, 252, (t3 * 255.0) as u8)
+                                egui::Color32::from_rgba_unmultiplied(242, 240, 236, (t3 * 255.0) as u8)
                             };
                             let path_border = egui::Color32::from_rgba_unmultiplied(
                                 c_border.r(), c_border.g(), c_border.b(), (t3 * 200.0) as u8,
@@ -1553,19 +1843,19 @@ impl VaultGui {
 
             let (bg, border, icon, text_col) = match kind {
                 ToastKind::Success => (
-                    if dm { egui::Color32::from_rgb(18, 44, 28) } else { egui::Color32::from_rgb(238, 255, 244) },
+                    if dm { egui::Color32::from_rgb(18, 44, 28) } else { egui::Color32::from_rgb(226, 244, 234) },
                     egui::Color32::from_rgb(55, 160, 88),
                     "✅",
                     egui::Color32::from_rgb(100, 210, 140),
                 ),
                 ToastKind::Error => (
-                    if dm { egui::Color32::from_rgb(52, 22, 22) } else { egui::Color32::from_rgb(255, 240, 240) },
+                    if dm { egui::Color32::from_rgb(52, 22, 22) } else { egui::Color32::from_rgb(255, 236, 236) },
                     egui::Color32::from_rgb(180, 55, 55),
                     "❌",
                     egui::Color32::from_rgb(255, 120, 120),
                 ),
                 ToastKind::Info => (
-                    if dm { egui::Color32::from_rgb(22, 26, 52) } else { egui::Color32::from_rgb(240, 242, 255) },
+                    if dm { egui::Color32::from_rgb(22, 26, 52) } else { egui::Color32::from_rgb(228, 225, 218) },
                     egui::Color32::from_rgb(88, 101, 242),
                     "ℹ️",
                     egui::Color32::from_rgb(140, 170, 255),
@@ -1628,18 +1918,18 @@ impl VaultGui {
         let dm = self.dark_mode;
         let accent    = egui::Color32::from_rgb(99, 111, 245);
         let green     = egui::Color32::from_rgb(66, 153, 54);
-        let c_title   = if dm { egui::Color32::from_rgb(232, 232, 245) } else { egui::Color32::from_rgb(18, 18, 34) };
-        let c_sub     = if dm { egui::Color32::from_rgb(160, 162, 185) } else { egui::Color32::from_rgb(100, 100, 122) };
+        let c_title   = if dm { egui::Color32::from_rgb(232, 232, 245) } else { egui::Color32::from_rgb(22, 19, 14) };
+        let c_sub     = if dm { egui::Color32::from_rgb(160, 162, 185) } else { egui::Color32::from_rgb(100, 94, 82) };
         // Modal window: clearly lighter than panel (18,20,28)
-        let c_win     = if dm { egui::Color32::from_rgb(28, 31, 44)  } else { egui::Color32::from_rgb(255, 255, 255) };
+        let c_win     = if dm { egui::Color32::from_rgb(28, 31, 44)  } else { egui::Color32::from_rgb(252, 250, 247) };
         // Input: clearly darker than modal window — deep inset look
-        let c_input   = if dm { egui::Color32::from_rgb(13, 14, 21)  } else { egui::Color32::from_rgb(244, 244, 252) };
+        let c_input   = if dm { egui::Color32::from_rgb(13, 14, 21)  } else { egui::Color32::from_rgb(242, 240, 236) };
         // Border: well above both fills
-        let c_border  = if dm { egui::Color32::from_rgb(62, 68, 95)  } else { egui::Color32::from_rgb(205, 205, 228) };
+        let c_border  = if dm { egui::Color32::from_rgb(62, 68, 95)  } else { egui::Color32::from_rgb(200, 195, 186) };
         // Field labels: bright enough to read easily
-        let c_lbl     = if dm { egui::Color32::from_rgb(188, 190, 215) } else { egui::Color32::from_rgb(68, 68, 92) };
+        let c_lbl     = if dm { egui::Color32::from_rgb(188, 190, 215) } else { egui::Color32::from_rgb(72, 66, 55) };
         // Cancel button: clearly visible, not overpowering
-        let c_cancel  = if dm { egui::Color32::from_rgb(45, 50, 70)  } else { egui::Color32::from_rgb(215, 215, 232) };
+        let c_cancel  = if dm { egui::Color32::from_rgb(45, 50, 70)  } else { egui::Color32::from_rgb(210, 206, 198) };
 
         // Helper to make a styled input field frame
         let input_field = |ui: &mut egui::Ui, fill: egui::Color32, stroke: egui::Stroke| {
@@ -1653,7 +1943,7 @@ impl VaultGui {
             // ────────────────────────────────────────────────────────────
             //  ADD ENTRY
             // ────────────────────────────────────────────────────────────
-            Modal::AddEntry { service, username, password, password_length } => {
+            Modal::AddEntry { service, username, password, password_length, totp_secret } => {
                 egui::Window::new("➕  Add New Entry")
                     .open(&mut modal_is_open)
                     .resizable(false).collapsible(false)
@@ -1668,14 +1958,14 @@ impl VaultGui {
                     )
                     .show(ctx, |ui| {
                         // Title bar
-                        let title_bg = if dm { egui::Color32::from_rgb(20, 22, 32) } else { egui::Color32::from_rgb(248, 248, 253) };
+                        let title_bg = if dm { egui::Color32::from_rgb(20, 22, 32) } else { egui::Color32::from_rgb(247, 246, 243) };
                         egui::Frame::none()
                             .fill(title_bg)
                             .rounding(egui::Rounding { nw: 14.0, ne: 14.0, sw: 0.0, se: 0.0 })
                             .inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 14.0, bottom: 14.0 })
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    let icon_bg = if dm { egui::Color32::from_rgb(36, 40, 58) } else { egui::Color32::from_rgb(230, 248, 236) };
+                                    let icon_bg = if dm { egui::Color32::from_rgb(36, 40, 58) } else { egui::Color32::from_rgb(226, 240, 232) };
                                     egui::Frame::none().fill(icon_bg).rounding(8.0)
                                         .inner_margin(egui::Margin::symmetric(7.0, 5.0))
                                         .show(ui, |ui| { ui.label(egui::RichText::new("➕").size(13.0)); });
@@ -1729,10 +2019,10 @@ impl VaultGui {
 
                         // Password generator panel
                         let gen_frame = egui::Frame::none()
-                            .fill(if dm { egui::Color32::from_rgb(13, 14, 21) } else { egui::Color32::from_rgb(240, 240, 252) })
+                            .fill(if dm { egui::Color32::from_rgb(13, 14, 21) } else { egui::Color32::from_rgb(238, 236, 230) })
                             .rounding(10.0)
                             .inner_margin(egui::Margin::symmetric(14.0, 12.0))
-                            .stroke(egui::Stroke::new(1.0, if dm { egui::Color32::from_rgb(58, 64, 90) } else { egui::Color32::from_rgb(200, 200, 225) }));
+                            .stroke(egui::Stroke::new(1.0, if dm { egui::Color32::from_rgb(58, 64, 90) } else { egui::Color32::from_rgb(196, 190, 180) }));
 
                         gen_frame.show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -1758,18 +2048,58 @@ impl VaultGui {
 
                         ui.add_space(18.0);
 
+                        // TOTP secret field
+                        ui.label(egui::RichText::new("🔑  TOTP Secret  (optional)").size(12.0).color(c_lbl));
+                        ui.add_space(4.0);
+                        let totp_valid = totp_secret.is_empty() || totp_base32_decode(totp_secret).is_some();
+                        let totp_stroke = if totp_valid {
+                            egui::Stroke::new(1.0, c_border)
+                        } else {
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(210, 60, 60))
+                        };
+                        input_field(ui, c_input, totp_stroke).show(ui, |ui| {
+                            ui.add(egui::TextEdit::singleline(totp_secret)
+                                .hint_text("Base32 secret from QR code (e.g. JBSWY3DPEHPK3PXP)")
+                                .desired_width(ui.available_width()).frame(false));
+                        });
+                        if !totp_secret.is_empty() {
+                            ui.add_space(6.0);
+                            if let Some((code, secs)) = totp_now(totp_secret) {
+                                let totp_bg = if dm { egui::Color32::from_rgb(18, 22, 42) } else { egui::Color32::from_rgb(235, 232, 252) };
+                                egui::Frame::none().fill(totp_bg).rounding(8.0)
+                                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                                    .stroke(egui::Stroke::new(1.0, accent))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("🔒").size(13.0));
+                                            ui.add_space(6.0);
+                                            ui.label(egui::RichText::new(&code).size(18.0).strong().monospace().color(accent));
+                                            ui.add_space(8.0);
+                                            ui.label(egui::RichText::new(format!("{}s", secs)).size(11.5).color(c_sub));
+                                        });
+                                    });
+                                ui.ctx().request_repaint_after(Duration::from_secs(1));
+                            } else {
+                                ui.label(egui::RichText::new("⚠  Invalid base32 secret").size(11.5)
+                                    .color(egui::Color32::from_rgb(210, 80, 80)));
+                            }
+                        }
+
+                        ui.add_space(18.0);
+
                         // Action row
                         ui.horizontal(|ui| {
                             let can_add = !service.is_empty() && !username.is_empty();
                             let add_fill = if can_add { green } else {
-                                if dm { egui::Color32::from_rgb(44, 48, 62) } else { egui::Color32::from_rgb(200, 200, 215) }
+                                if dm { egui::Color32::from_rgb(44, 48, 62) } else { egui::Color32::from_rgb(194, 189, 180) }
                             };
                             let add_btn = egui::Button::new(
                                 egui::RichText::new("➕  Add Entry").size(14.0).color(egui::Color32::WHITE)
                             )
                             .fill(add_fill).rounding(9.0).min_size(egui::vec2(130.0, 40.0));
                             if ui.add_enabled(can_add, add_btn).clicked() {
-                                self.add_entry_and_save(service.clone(), username.clone(), password.clone());
+                                let secret = if totp_secret.is_empty() { None } else { Some(totp_secret.trim().to_uppercase().replace([' ', '-'], "")) };
+                                self.add_entry_and_save(service.clone(), username.clone(), password.clone(), secret);
                                 close_on_action = true;
                             }
                             ui.add_space(8.0);
@@ -1785,7 +2115,7 @@ impl VaultGui {
             // ────────────────────────────────────────────────────────────
             //  EDIT ENTRY
             // ────────────────────────────────────────────────────────────
-            Modal::EditEntry { original_id, service, username, password } => {
+            Modal::EditEntry { original_id, service, username, password, totp_secret } => {
                 egui::Window::new("edit_entry_modal")
                     .open(&mut modal_is_open)
                     .resizable(false).collapsible(false)
@@ -1800,14 +2130,14 @@ impl VaultGui {
                     )
                     .show(ctx, |ui| {
                         // Title bar
-                        let title_bg = if dm { egui::Color32::from_rgb(20, 22, 32) } else { egui::Color32::from_rgb(248, 248, 253) };
+                        let title_bg = if dm { egui::Color32::from_rgb(20, 22, 32) } else { egui::Color32::from_rgb(247, 246, 243) };
                         egui::Frame::none()
                             .fill(title_bg)
                             .rounding(egui::Rounding { nw: 14.0, ne: 14.0, sw: 0.0, se: 0.0 })
                             .inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 14.0, bottom: 14.0 })
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    let icon_bg = if dm { egui::Color32::from_rgb(36, 40, 58) } else { egui::Color32::from_rgb(232, 232, 248) };
+                                    let icon_bg = if dm { egui::Color32::from_rgb(36, 40, 58) } else { egui::Color32::from_rgb(228, 225, 218) };
                                     egui::Frame::none().fill(icon_bg).rounding(8.0)
                                         .inner_margin(egui::Margin::symmetric(7.0, 5.0))
                                         .show(ui, |ui| { ui.label(egui::RichText::new("✏️").size(13.0)); });
@@ -1840,6 +2170,43 @@ impl VaultGui {
                                 input_field(ui, c_input, field_stroke).show(ui, |ui| {
                                     ui.add(egui::TextEdit::singleline(password).password(true).desired_width(ui.available_width()).frame(false));
                                 });
+                                ui.add_space(10.0);
+
+                                // TOTP secret
+                                ui.label(egui::RichText::new("🔑  TOTP Secret  (BETA)").size(12.0).color(c_lbl));
+                                ui.add_space(4.0);
+                                let totp_valid = totp_secret.is_empty() || totp_base32_decode(totp_secret).is_some();
+                                let totp_stroke = if totp_valid { field_stroke } else {
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(210, 60, 60))
+                                };
+                                input_field(ui, c_input, totp_stroke).show(ui, |ui| {
+                                    ui.add(egui::TextEdit::singleline(totp_secret)
+                                        .hint_text("Base32 secret — leave blank to remove")
+                                        .desired_width(ui.available_width()).frame(false));
+                                });
+                                if !totp_secret.is_empty() {
+                                    ui.add_space(6.0);
+                                    if let Some((code, secs)) = totp_now(totp_secret) {
+                                        let totp_bg = if dm { egui::Color32::from_rgb(18, 22, 42) } else { egui::Color32::from_rgb(235, 232, 252) };
+                                        egui::Frame::none().fill(totp_bg).rounding(8.0)
+                                            .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                                            .stroke(egui::Stroke::new(1.0, accent))
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new("🔒").size(13.0));
+                                                    ui.add_space(6.0);
+                                                    ui.label(egui::RichText::new(&code).size(18.0).strong().monospace().color(accent));
+                                                    ui.add_space(8.0);
+                                                    ui.label(egui::RichText::new(format!("{}s", secs)).size(11.5).color(c_sub));
+                                                });
+                                            });
+                                        ui.ctx().request_repaint_after(Duration::from_secs(1));
+                                    } else {
+                                        ui.label(egui::RichText::new("⚠  Invalid base32 secret").size(11.5)
+                                            .color(egui::Color32::from_rgb(210, 80, 80)));
+                                    }
+                                }
+
                                 ui.add_space(18.0);
 
                                 ui.horizontal(|ui| {
@@ -1852,6 +2219,9 @@ impl VaultGui {
                                             entry.service = service.clone();
                                             entry.username = username.clone();
                                             entry.password = password.clone();
+                                            entry.totp_secret = if totp_secret.is_empty() { None } else {
+                                                Some(totp_secret.trim().to_uppercase().replace([' ', '-'], ""))
+                                            };
                                             self.save_after_change();
                                         }
                                         close_on_action = true;
@@ -1884,14 +2254,14 @@ impl VaultGui {
                             .inner_margin(egui::Margin::same(0.0))
                     )
                     .show(ctx, |ui| {
-                        let title_bg = if dm { egui::Color32::from_rgb(20, 22, 32) } else { egui::Color32::from_rgb(248, 248, 253) };
+                        let title_bg = if dm { egui::Color32::from_rgb(20, 22, 32) } else { egui::Color32::from_rgb(247, 246, 243) };
                         egui::Frame::none()
                             .fill(title_bg)
                             .rounding(egui::Rounding { nw: 14.0, ne: 14.0, sw: 0.0, se: 0.0 })
                             .inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 14.0, bottom: 14.0 })
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    let icon_bg = if dm { egui::Color32::from_rgb(40, 36, 58) } else { egui::Color32::from_rgb(235, 232, 252) };
+                                    let icon_bg = if dm { egui::Color32::from_rgb(40, 36, 58) } else { egui::Color32::from_rgb(230, 227, 218) };
                                     egui::Frame::none().fill(icon_bg).rounding(8.0)
                                         .inner_margin(egui::Margin::symmetric(7.0, 5.0))
                                         .show(ui, |ui| { ui.label(egui::RichText::new("🔑").size(13.0)); });
@@ -1937,7 +2307,7 @@ impl VaultGui {
                                 if mismatch {
                                     ui.add_space(6.0);
                                     let warn_frame = egui::Frame::none()
-                                        .fill(if dm { egui::Color32::from_rgb(50, 18, 18) } else { egui::Color32::from_rgb(255, 240, 240) })
+                                        .fill(if dm { egui::Color32::from_rgb(50, 18, 18) } else { egui::Color32::from_rgb(255, 236, 236) })
                                         .rounding(8.0)
                                         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(155, 45, 45)));
@@ -1956,7 +2326,7 @@ impl VaultGui {
                                 ui.horizontal(|ui| {
                                     let can_change = !old.is_empty() && !new.is_empty() && new == confirm;
                                     let btn_fill = if can_change { accent } else {
-                                        if dm { egui::Color32::from_rgb(44, 48, 62) } else { egui::Color32::from_rgb(200, 200, 215) }
+                                        if dm { egui::Color32::from_rgb(44, 48, 62) } else { egui::Color32::from_rgb(194, 189, 180) }
                                     };
                                     let change_btn = egui::Button::new(
                                         egui::RichText::new("💾  Change Password").size(14.0).color(egui::Color32::WHITE)
@@ -2106,12 +2476,12 @@ impl VaultGui {
                 ];
 
                 // Colors
-                let c_sidebar = if dm { egui::Color32::from_rgb(11, 12, 19) } else { egui::Color32::from_rgb(242, 242, 250) };
-                let c_divider = if dm { egui::Color32::from_rgb(42, 46, 62) } else { egui::Color32::from_rgb(218, 218, 234) };
-                let c_tab_active_bg = if dm { egui::Color32::from_rgb(32, 36, 58) } else { egui::Color32::from_rgb(255, 255, 255) };
-                let c_tab_hover_bg  = if dm { egui::Color32::from_rgb(24, 26, 42) } else { egui::Color32::from_rgb(232, 232, 248) };
+                let c_sidebar = if dm { egui::Color32::from_rgb(11, 12, 19) } else { egui::Color32::from_rgb(240, 238, 234) };
+                let c_divider = if dm { egui::Color32::from_rgb(42, 46, 62) } else { egui::Color32::from_rgb(210, 206, 198) };
+                let c_tab_active_bg = if dm { egui::Color32::from_rgb(32, 36, 58) } else { egui::Color32::from_rgb(252, 250, 247) };
+                let c_tab_hover_bg  = if dm { egui::Color32::from_rgb(24, 26, 42) } else { egui::Color32::from_rgb(228, 225, 218) };
                 let c_tab_icon_active = accent;
-                let c_tab_icon_idle   = if dm { egui::Color32::from_rgb(115, 120, 152) } else { egui::Color32::from_rgb(148, 148, 175) };
+                let c_tab_icon_idle   = if dm { egui::Color32::from_rgb(115, 120, 152) } else { egui::Color32::from_rgb(130, 124, 112) };
 
                 // Helper: animated toggle
                 let draw_toggle = |ui: &mut egui::Ui, ctx: &egui::Context, id: &str, value: bool, accent: egui::Color32| -> bool {
@@ -2121,7 +2491,7 @@ impl VaultGui {
                     let cur_val = if clicked { !value } else { value };
                     let t = ctx.animate_bool_with_time(egui::Id::new(id), cur_val, 0.18);
                     if ui.is_rect_visible(rect) {
-                        let off_color = if dm { egui::Color32::from_rgb(68, 72, 96) } else { egui::Color32::from_rgb(200, 200, 218) };
+                        let off_color = if dm { egui::Color32::from_rgb(68, 72, 96) } else { egui::Color32::from_rgb(198, 194, 186) };
                         let bg = egui::Color32::from_rgb(
                             (off_color.r() as f32 + (accent.r() as f32 - off_color.r() as f32) * t) as u8,
                             (off_color.g() as f32 + (accent.g() as f32 - off_color.g() as f32) * t) as u8,
@@ -2162,7 +2532,7 @@ impl VaultGui {
                     )
                     .show(ctx, |ui| {
                         // ── Custom title bar — rounded top to match outer window ──
-                        let title_bg = if dm { egui::Color32::from_rgb(13, 14, 21) } else { egui::Color32::from_rgb(248, 248, 253) };
+                        let title_bg = if dm { egui::Color32::from_rgb(13, 14, 21) } else { egui::Color32::from_rgb(247, 246, 243) };
                         egui::Frame::none()
                             .fill(title_bg)
                             .rounding(egui::Rounding { nw: 14.0, ne: 14.0, sw: 0.0, se: 0.0 })
@@ -2173,7 +2543,7 @@ impl VaultGui {
                                     let icon_bg = if dm {
                                         egui::Color32::from_rgb(36, 40, 60)
                                     } else {
-                                        egui::Color32::from_rgb(230, 230, 248)
+                                        egui::Color32::from_rgb(230, 227, 218)
                                     };
                                     egui::Frame::none()
                                         .fill(icon_bg)
@@ -2714,7 +3084,7 @@ impl VaultGui {
                                     }); // ScrollArea
 
                                     // ── Done button — always visible, outside scroll area ──
-                                    let c_done_sep = if dm { egui::Color32::from_rgb(38, 42, 58) } else { egui::Color32::from_rgb(225, 225, 242) };
+                                    let c_done_sep = if dm { egui::Color32::from_rgb(38, 42, 58) } else { egui::Color32::from_rgb(215, 211, 204) };
                                     ui.painter().hline(
                                         ui.available_rect_before_wrap().x_range(),
                                         ui.cursor().top(),
@@ -2763,37 +3133,36 @@ impl App for VaultGui {
             style.visuals.override_text_color = Some(egui::Color32::from_rgb(225, 225, 238));
             style.visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 66, 90));
         } else {
-            // Light theme — clean white/warm-grey, crisp typography
+            // Light theme — warm white base, ink text, indigo accent only
             style.visuals.dark_mode = false;
-            style.visuals.window_fill                         = egui::Color32::from_rgb(252, 252, 254);
-            style.visuals.panel_fill                          = egui::Color32::from_rgb(248, 248, 252);
-            style.visuals.extreme_bg_color                    = egui::Color32::from_rgb(240, 240, 248);
-            // Widget fills — neutral greys, not blue-tinted
-            style.visuals.widgets.noninteractive.bg_fill      = egui::Color32::from_rgb(232, 232, 238);
-            style.visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(242, 242, 246);
-            style.visuals.widgets.inactive.bg_fill            = egui::Color32::from_rgb(225, 225, 232);
-            style.visuals.widgets.inactive.weak_bg_fill       = egui::Color32::from_rgb(238, 238, 244);
-            style.visuals.widgets.hovered.bg_fill             = egui::Color32::from_rgb(210, 212, 230);
-            style.visuals.widgets.hovered.weak_bg_fill        = egui::Color32::from_rgb(228, 228, 242);
+            // Background surfaces — warm white, not blue-tinted
+            style.visuals.window_fill                         = egui::Color32::from_rgb(250, 249, 246);
+            style.visuals.panel_fill                          = egui::Color32::from_rgb(246, 245, 242);
+            style.visuals.extreme_bg_color                    = egui::Color32::from_rgb(238, 236, 232);
+            // Widget fills — warm neutral greys
+            style.visuals.widgets.noninteractive.bg_fill      = egui::Color32::from_rgb(234, 232, 228);
+            style.visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(243, 242, 239);
+            style.visuals.widgets.inactive.bg_fill            = egui::Color32::from_rgb(228, 226, 222);
+            style.visuals.widgets.inactive.weak_bg_fill       = egui::Color32::from_rgb(240, 239, 236);
+            style.visuals.widgets.hovered.bg_fill             = egui::Color32::from_rgb(218, 216, 210);
+            style.visuals.widgets.hovered.weak_bg_fill        = egui::Color32::from_rgb(232, 230, 226);
             style.visuals.widgets.active.bg_fill              = egui::Color32::from_rgb(88, 101, 242);
             style.visuals.widgets.active.weak_bg_fill         = egui::Color32::from_rgb(88, 101, 242);
-            style.visuals.selection.bg_fill                   = egui::Color32::from_rgba_unmultiplied(88, 101, 242, 40);
+            style.visuals.selection.bg_fill                   = egui::Color32::from_rgba_unmultiplied(88, 101, 242, 38);
             style.visuals.selection.stroke                    = egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 101, 242));
-            // Text — near-black for readability
-            style.visuals.override_text_color                 = Some(egui::Color32::from_rgb(16, 16, 28));
-            // Strokes — soft grey, not purple-blue
-            style.visuals.window_stroke                       = egui::Stroke::new(1.0, egui::Color32::from_rgb(218, 218, 228));
-            style.visuals.widgets.noninteractive.fg_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 115));
-            style.visuals.widgets.inactive.fg_stroke          = egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 100));
-            style.visuals.widgets.hovered.fg_stroke           = egui::Stroke::new(1.5, egui::Color32::from_rgb(30, 30, 50));
+            // Text — deep warm ink, not blue-black
+            style.visuals.override_text_color                 = Some(egui::Color32::from_rgb(22, 19, 14));
+            // Strokes — warm stone, not cool grey
+            style.visuals.window_stroke                       = egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 207, 200));
+            style.visuals.widgets.noninteractive.fg_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 106, 98));
+            style.visuals.widgets.inactive.fg_stroke          = egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 86, 78));
+            style.visuals.widgets.hovered.fg_stroke           = egui::Stroke::new(1.5, egui::Color32::from_rgb(30, 26, 18));
             style.visuals.widgets.active.fg_stroke            = egui::Stroke::new(2.0, egui::Color32::WHITE);
-            // Borders on inactive widgets — subtle
-            style.visuals.widgets.noninteractive.bg_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 210, 222));
-            style.visuals.widgets.inactive.bg_stroke          = egui::Stroke::new(1.0, egui::Color32::from_rgb(205, 205, 218));
-            style.visuals.widgets.hovered.bg_stroke           = egui::Stroke::new(1.5, egui::Color32::from_rgb(160, 168, 210));
+            style.visuals.widgets.noninteractive.bg_stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgb(208, 204, 196));
+            style.visuals.widgets.inactive.bg_stroke          = egui::Stroke::new(1.0, egui::Color32::from_rgb(196, 190, 180));
+            style.visuals.widgets.hovered.bg_stroke           = egui::Stroke::new(1.5, egui::Color32::from_rgb(140, 136, 128));
             style.visuals.widgets.active.bg_stroke            = egui::Stroke::new(0.0, egui::Color32::TRANSPARENT);
             style.visuals.hyperlink_color                     = egui::Color32::from_rgb(88, 101, 242);
-            // Rounding — consistent with dark mode
             style.visuals.window_rounding                     = egui::Rounding::same(12.0);
             style.visuals.menu_rounding                       = egui::Rounding::same(8.0);
         }
@@ -2848,14 +3217,14 @@ impl App for VaultGui {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Top navigation bar
-            let nav_bg = if self.dark_mode { egui::Color32::from_rgb(14, 15, 22) } else { egui::Color32::from_rgb(252, 252, 254) };
+            let nav_bg = if self.dark_mode { egui::Color32::from_rgb(14, 15, 22) } else { egui::Color32::from_rgb(250, 249, 246) };
             let nav_frame = egui::Frame::none()
                 .fill(nav_bg)
                 .inner_margin(egui::Margin { left: 20.0, right: 20.0, top: 12.0, bottom: 12.0 });
                 
             nav_frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let title_color = if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::from_rgb(20, 20, 35) };
+                    let title_color = if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::from_rgb(22, 19, 14) };
                     let accent = egui::Color32::from_rgb(88, 101, 242);
                     // Shield icon in accent color, name in primary text color
                     ui.label(egui::RichText::new("🛡️").size(18.0).color(accent));
@@ -2867,7 +3236,7 @@ impl App for VaultGui {
                             let back_button = egui::Button::new(
                                 egui::RichText::new("← Back")
                                     .size(13.0)
-                                    .color(if self.dark_mode { egui::Color32::from_rgb(215, 215, 232) } else { egui::Color32::from_rgb(50, 50, 72) })
+                                    .color(if self.dark_mode { egui::Color32::from_rgb(210, 206, 198) } else { egui::Color32::from_rgb(44, 38, 28) })
                             )
                             .fill(egui::Color32::TRANSPARENT)
                             .stroke(egui::Stroke::new(1.0, if self.dark_mode { egui::Color32::from_rgb(95, 100, 128) } else { egui::Color32::from_rgb(195, 195, 215) }))
@@ -2899,7 +3268,7 @@ impl App for VaultGui {
                             let issues_button = egui::Button::new(
                                 egui::RichText::new("ℹ️  Info")
                                     .size(12.0)
-                                    .color(if self.dark_mode { egui::Color32::from_rgb(210, 210, 230) } else { egui::Color32::from_rgb(60, 60, 80) })
+                                    .color(if self.dark_mode { egui::Color32::from_rgb(205, 200, 192) } else { egui::Color32::from_rgb(56, 50, 40) })
                             )
                             .fill(btn_fill)
                             .stroke(egui::Stroke::new(1.0, btn_stroke_color))
@@ -2917,7 +3286,7 @@ impl App for VaultGui {
             });
             
             // Thin accent separator under the nav bar May
-            let sep_color = if self.dark_mode { egui::Color32::from_rgb(50, 55, 75) } else { egui::Color32::from_rgb(218, 218, 228) };
+            let sep_color = if self.dark_mode { egui::Color32::from_rgb(50, 55, 75) } else { egui::Color32::from_rgb(210, 206, 198) };
             ui.painter().hline(
                 ui.available_rect_before_wrap().x_range(),
                 ui.cursor().top(),
@@ -2985,4 +3354,4 @@ fn main() -> Result<(), Box<dyn StdError>> {
         }),
     ).map_err(|e| e.into())
 }
-// 2026
+// 2026 Done Entry optional
