@@ -1,6 +1,6 @@
 [package]
 name = "Aegis"
-version = "1.0.3"
+version = "1.0.6"
 edition = "2021"
 # --- START: Required for Icon Embedding ---
 build = "build.rs" 
