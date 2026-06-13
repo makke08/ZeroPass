@@ -78,6 +78,7 @@ The vault can be copied to another device as long as the master password is know
 ## 🛣️ Roadmap
 
 - [ ] ✓ TOTP authenticator support
+- [ ] Added support for Linux and Mac
 - [ ] Password health audit
 - [ ] Duplicate password detection
 - [ ] Categories & tags
