@@ -101,7 +101,7 @@ GNU AFFERO GENERAL PUBLIC LICENSE
 
 ---
 
-##⚠️ Windows Security Warning
+## ⚠️ Windows Security Warning
 
 This app is not code-signed, so Windows Defender SmartScreen may show a warning when you run it.
 This is normal for unsigned programs and doesn’t necessarily mean the file is unsafe if downloaded from this repository.
@@ -111,5 +111,7 @@ Click “More info”
 Then click “Run anyway”
 
 You can also review or build the source code yourself for full transparency.
+
+---
 
 Built with ❤️ in Rust.
