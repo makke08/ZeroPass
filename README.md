@@ -58,52 +58,19 @@ cargo run --release
 
 ---
 
-## 🔐 Security
+## 📖 Usage
+Initialization: Upon the first launch, the app will generate your project directory and guide you through creating your first master password.
+Vault Management: The application automatically tracks the last opened vault, or creates a default one if none exists.
+Clipboard: When you copy a password, the app will automatically clear it after a set duration to protect your sensitive data.
 
-ZeroPass uses:
-
-- Argon2id for key derivation
-- XChaCha20-Poly1305 authenticated encryption
-- Random cryptographic salts
-- Random cryptographic nonces
-- Automatic memory zeroization where possible
-
-All encryption and decryption happens locally on your machine.
-
-No data is sent to external servers.
-
----
-
-## 📂 Vault Location
-
-Vault files are stored locally in the application's data directory.
-
-The vault can be copied to another device as long as the master password is known.
-
----
-
-## 🛣️ Roadmap
-
-- [ ] ✓ TOTP authenticator support
-- [ ] Support for Linux and Mac
-- [ ] Duplicate password detection
-- [ ] ✓ Categories & tags
-- [ ] Windows Hello support
-- [ ] ✓ Secure notes
-- [ ] Encrypted backups
-- [ ] ✓ Import/export support
-
----
+## ⚠️ Disclaimer
+ZeroPass is currently in **BETA**. While we prioritize security, this software has not undergone a professional security audit. Please ensure you maintain separate backups of your critical data.
 
 ## 🤝 Contributing
-
-Pull requests, bug reports, and feature suggestions are welcome.
-
----
+Contributions are welcome! If you find a bug or have a feature request, please open an issue or submit a pull request.
 
 ## 📜 License
-
-GNU AFFERO GENERAL PUBLIC LICENSE
+This project is licensed under the MIT License. See the LICENSE file for details.
 
 ---
 
