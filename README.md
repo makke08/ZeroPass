@@ -64,22 +64,22 @@ xcode-select --install
 ```
 ---
 
-Ubuntu / Debian
+## Ubuntu / Debian
 ```bash
 sudo apt-get update
 sudo apt-get install -y libasound2-dev pkg-config libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev
 ```
 ---
-Fedora
+## Fedora
 ```bash
 sudo dnf install alsa-lib-devel pkg-config fontconfig-devel libxcb-devel
 ```
 ---
-Arch Linux
+## Arch Linux
 ```bash
 sudo pacman -S alsa-lib pkgconf fontconfig libxcb
 ```
-Then run the following:
+**Then run the following:**
 ```bash
 git clone https://github.com/makke08/ZeroPass.git
 cd ZeroPass
