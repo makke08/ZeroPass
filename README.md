@@ -37,53 +37,48 @@ ZeroPass is built on a "Zero-Knowledge" philosophy:
 
 ### Building from Source
 
-**Clone the repository:**
+## 💻 OS-Specific Prerequisites
+While ZeroPass is cross-platform, GUI and audio libraries require some native system dependencies depending on your operating system:
 
-```bash
-git clone https://github.com/makke08/ZeroPass.git
-cd ZeroPass
-```
+## 🪟 Windows
+No extra setup is required. Just ensure you have Rust and Cargo installed. Or, you can download and run the installer in the releases page
 
-### Build
-
-```bash
-cargo build --release
-```
-
-### Run
-
-```bash
-cargo run --release
-```
-
----
-
-## MacOS
+## 🍎 macOS
+You need the command line developer tools. Run this in your terminal:
 ```bash
 xcode-select --install
 ```
----
 
-## Ubuntu / Debian
+## 🐧 Linux
+You need ALSA (for audio) and X11/Wayland development headers (for the GUI and clipboard).
+
+**Ubuntu / Debian**
 ```bash
 sudo apt-get update
 sudo apt-get install -y libasound2-dev pkg-config libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev
 ```
----
-## Fedora
+
+**Fedora**
 ```bash
 sudo dnf install alsa-lib-devel pkg-config fontconfig-devel libxcb-devel
 ```
----
-## Arch Linux
+
+**Arch Linux**
 ```bash
 sudo pacman -S alsa-lib pkgconf fontconfig libxcb
 ```
-**Then run the following:**
+
+## 🚀 Building and Running
+Once your prerequisites are met, run the following commands in your terminal:
+
+Clone the repository:
 ```bash
 git clone https://github.com/makke08/ZeroPass.git
 cd ZeroPass
-cargo run --release
+```
+Build:
+```bash
+cargo build --release
 ```
 ---
 
