@@ -58,7 +58,7 @@ const MINIMUM_LOAD_TIME: Duration = Duration::from_millis(0);
 // - - - Version checker constants - - -
 /// The app's own version, shown in the UI and compared against GitHub releases.
 /// Update this alongside Cargo.toml's `version` field on each release.
-const APP_VERSION: &str = "2.0.1-release";
+const APP_VERSION: &str = "2.0.2-release";
 /// Whether this build is itself a pre-release/beta build. Affects how the
 /// version checker interprets "newer" releases (see `check_for_updates`).
 const APP_IS_PRERELEASE: bool = false;
@@ -450,6 +450,21 @@ fn gen_id() -> String {
     let mut b = [0u8; 16];
     OsRng.fill_bytes(&mut b);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+/// Truncates a string (by char count, not bytes, so it's UTF-8/emoji safe) to
+/// `max_chars` and appends an ellipsis if it was cut short. Used anywhere
+/// user-supplied free text (titles, categories, tags, etc.) is rendered in a
+/// fixed-width UI element, so a single very long word can't blow out layout,
+/// overlap other widgets, or run off the edge of the window.
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}…", truncated)
+    }
 }
 
 /// Formats a Unix timestamp (seconds) as a short relative "time ago" string
@@ -1716,7 +1731,7 @@ impl VaultGui {
 
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(&entry.service).size(15.0).strong().color(fc_a(c_title, t_card)));
+                                ui.label(egui::RichText::new(truncate_display(&entry.service, 40)).size(15.0).strong().color(fc_a(c_title, t_card)));
                                 if entry.pinned {
                                     ui.add_space(5.0);
                                     let pin_col = fc_a(egui::Color32::from_rgb(240, 180, 50), t_card);
@@ -1724,7 +1739,7 @@ impl VaultGui {
                                 }
                             });
                             ui.add_space(2.0);
-                            ui.label(egui::RichText::new(&entry.username).size(12.0).color(fc_a(c_sub, t_card)));
+                            ui.label(egui::RichText::new(truncate_display(&entry.username, 48)).size(12.0).color(fc_a(c_sub, t_card)));
                             // - - - Category & tags row - - -
                             let has_cat  = entry.category.as_deref().map_or(false, |c| !c.is_empty());
                             let has_tags = !entry.tags.is_empty();
@@ -1741,7 +1756,7 @@ impl VaultGui {
                                                 .rounding(6.0)
                                                 .inner_margin(egui::Margin::symmetric(5.0, 2.0))
                                                 .show(ui, |ui| {
-                                                    ui.label(egui::RichText::new(format!("📁 {}", cat)).size(10.0).color(fc_a(cat_txt, t_card)));
+                                                    ui.label(egui::RichText::new(format!("📁 {}", truncate_display(cat, 20))).size(10.0).color(fc_a(cat_txt, t_card)));
                                                 });
                                         }
                                     }
@@ -1754,7 +1769,7 @@ impl VaultGui {
                                                 .rounding(6.0)
                                                 .inner_margin(egui::Margin::symmetric(5.0, 2.0))
                                                 .show(ui, |ui| {
-                                                    ui.label(egui::RichText::new(format!("🏷 {}", tag)).size(10.0).color(fc_a(tag_txt, t_card)));
+                                                    ui.label(egui::RichText::new(format!("🏷 {}", truncate_display(tag, 20))).size(10.0).color(fc_a(tag_txt, t_card)));
                                                 });
                                         }
                                     }
@@ -2141,7 +2156,7 @@ impl VaultGui {
                         ui.vertical(|ui| {
                             // - - - Title row with word count - - -
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(&note.title).size(14.0).strong().color(fc(c_title, t_card)));
+                                ui.label(egui::RichText::new(truncate_display(&note.title, 40)).size(14.0).strong().color(fc(c_title, t_card)));
                                 if !note.content.is_empty() {
                                     let word_count = note.content.split_whitespace().count();
                                     let wc_txt = format!("{} w", word_count);
@@ -2178,7 +2193,7 @@ impl VaultGui {
                                             egui::Frame::none().fill(fc(cat_bg, t_card)).rounding(6.0)
                                                 .inner_margin(egui::Margin::symmetric(5.0, 2.0))
                                                 .show(ui, |ui| {
-                                                    ui.label(egui::RichText::new(format!("📁 {}", cat)).size(10.0).color(fc(cat_txt, t_card)));
+                                                    ui.label(egui::RichText::new(format!("📁 {}", truncate_display(cat, 20))).size(10.0).color(fc(cat_txt, t_card)));
                                                 });
                                         }
                                     }
@@ -2189,7 +2204,7 @@ impl VaultGui {
                                             egui::Frame::none().fill(fc(tag_bg, t_card)).rounding(6.0)
                                                 .inner_margin(egui::Margin::symmetric(5.0, 2.0))
                                                 .show(ui, |ui| {
-                                                    ui.label(egui::RichText::new(format!("🏷 {}", tag)).size(10.0).color(fc(tag_txt, t_card)));
+                                                    ui.label(egui::RichText::new(format!("🏷 {}", truncate_display(tag, 20))).size(10.0).color(fc(tag_txt, t_card)));
                                                 });
                                         }
                                     }
@@ -3996,6 +4011,7 @@ impl VaultGui {
                         input_field(ui, c_input, field_stroke).show(ui, |ui| {
                             ui.add(egui::TextEdit::singleline(service)
                                 .hint_text("e.g. GitHub, Gmail, Netflix")
+                                .char_limit(60)
                                 .desired_width(ui.available_width()).frame(false));
                         });
 
@@ -4007,6 +4023,7 @@ impl VaultGui {
                         input_field(ui, c_input, field_stroke).show(ui, |ui| {
                             ui.add(egui::TextEdit::singleline(username)
                                 .hint_text("Username or email address")
+                                .char_limit(100)
                                 .desired_width(ui.available_width()).frame(false));
                         });
 
@@ -4075,6 +4092,7 @@ impl VaultGui {
                         input_field(ui, c_input, field_stroke).show(ui, |ui| {
                             ui.add(egui::TextEdit::singleline(category)
                                 .hint_text("e.g. Work, Finance, Social")
+                                .char_limit(30)
                                 .desired_width(ui.available_width()).frame(false));
                         });
 
@@ -4086,6 +4104,7 @@ impl VaultGui {
                         input_field(ui, c_input, field_stroke).show(ui, |ui| {
                             ui.add(egui::TextEdit::singleline(tags)
                                 .hint_text("e.g. personal, 2fa, important  (comma separated)")
+                                .char_limit(150)
                                 .desired_width(ui.available_width()).frame(false));
                         });
 
@@ -4337,14 +4356,14 @@ impl VaultGui {
                                 ui.label(egui::RichText::new("🌐  Service").size(12.0).color(c_lbl));
                                 ui.add_space(4.0);
                                 input_field(ui, c_input, field_stroke).show(ui, |ui| {
-                                    ui.add(egui::TextEdit::singleline(service).desired_width(ui.available_width()).frame(false));
+                                    ui.add(egui::TextEdit::singleline(service).char_limit(60).desired_width(ui.available_width()).frame(false));
                                 });
                                 ui.add_space(10.0);
 
                                 ui.label(egui::RichText::new("👤  Username / Email").size(12.0).color(c_lbl));
                                 ui.add_space(4.0);
                                 input_field(ui, c_input, field_stroke).show(ui, |ui| {
-                                    ui.add(egui::TextEdit::singleline(username).desired_width(ui.available_width()).frame(false));
+                                    ui.add(egui::TextEdit::singleline(username).char_limit(100).desired_width(ui.available_width()).frame(false));
                                 });
                                 ui.add_space(10.0);
 
@@ -4513,6 +4532,7 @@ impl VaultGui {
                                 input_field(ui, c_input, field_stroke).show(ui, |ui| {
                                     ui.add(egui::TextEdit::singleline(category)
                                         .hint_text("e.g. Work, Finance, Social")
+                                        .char_limit(30)
                                         .desired_width(ui.available_width()).frame(false));
                                 });
 
@@ -4524,6 +4544,7 @@ impl VaultGui {
                                 input_field(ui, c_input, field_stroke).show(ui, |ui| {
                                     ui.add(egui::TextEdit::singleline(tags)
                                         .hint_text("e.g. personal, 2fa, important  (comma separated)")
+                                        .char_limit(150)
                                         .desired_width(ui.available_width()).frame(false));
                                 });
 
@@ -5257,6 +5278,7 @@ impl VaultGui {
                                     ui.add_space(4.0);
                                     input_field_fn(ui, c_input, field_stroke).show(ui, |ui| {
                                         ui.add(egui::TextEdit::singleline(title).hint_text("Note title")
+                                            .char_limit(60)
                                             .desired_width(ui.available_width()).frame(false));
                                     });
                                     ui.add_space(10.0);
@@ -5277,6 +5299,7 @@ impl VaultGui {
                                     ui.add_space(4.0);
                                     input_field_fn(ui, c_input, field_stroke).show(ui, |ui| {
                                         ui.add(egui::TextEdit::singleline(category).hint_text("e.g. Personal, Work")
+                                            .char_limit(30)
                                             .desired_width(ui.available_width()).frame(false));
                                     });
                                     ui.add_space(10.0);
@@ -5285,6 +5308,7 @@ impl VaultGui {
                                     ui.add_space(4.0);
                                     input_field_fn(ui, c_input, field_stroke).show(ui, |ui| {
                                         ui.add(egui::TextEdit::singleline(tags).hint_text("comma separated")
+                                            .char_limit(150)
                                             .desired_width(ui.available_width()).frame(false));
                                     });
                                     ui.add_space(6.0);
@@ -5364,7 +5388,7 @@ impl VaultGui {
                                     ui.label(egui::RichText::new("📝  Title").size(12.0).color(c_lbl));
                                     ui.add_space(4.0);
                                     input_field_fn(ui, c_input, field_stroke).show(ui, |ui| {
-                                        ui.add(egui::TextEdit::singleline(title).desired_width(ui.available_width()).frame(false));
+                                        ui.add(egui::TextEdit::singleline(title).char_limit(60).desired_width(ui.available_width()).frame(false));
                                     });
                                     ui.add_space(10.0);
 
@@ -5382,14 +5406,14 @@ impl VaultGui {
                                     ui.label(egui::RichText::new("📁  Category").size(12.0).color(c_lbl));
                                     ui.add_space(4.0);
                                     input_field_fn(ui, c_input, field_stroke).show(ui, |ui| {
-                                        ui.add(egui::TextEdit::singleline(category).desired_width(ui.available_width()).frame(false));
+                                        ui.add(egui::TextEdit::singleline(category).char_limit(30).desired_width(ui.available_width()).frame(false));
                                     });
                                     ui.add_space(10.0);
 
                                     ui.label(egui::RichText::new("🏷  Tags").size(12.0).color(c_lbl));
                                     ui.add_space(4.0);
                                     input_field_fn(ui, c_input, field_stroke).show(ui, |ui| {
-                                        ui.add(egui::TextEdit::singleline(tags).desired_width(ui.available_width()).frame(false));
+                                        ui.add(egui::TextEdit::singleline(tags).char_limit(150).desired_width(ui.available_width()).frame(false));
                                     });
                                     ui.add_space(6.0);
                                 }); // - - - inner frame - - -
@@ -6014,12 +6038,13 @@ impl App for VaultGui {
                     egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), if dm { 28 } else { 18 })
                 } else { egui::Color32::TRANSPARENT };
                 let txt = if active { col } else { c_sub };
-                let full_label = if active { format!("● {}", label) } else { format!("  {}", label) };
+                let short_label = truncate_display(label, 24);
+                let full_label = if active { format!("● {}", short_label) } else { format!("  {}", short_label) };
                 ui.add(
                     egui::Button::new(egui::RichText::new(full_label).size(12.0).color(txt))
                         .fill(bg).stroke(egui::Stroke::NONE).rounding(6.0)
                         .min_size(egui::vec2(ui.available_width(), 26.0))
-                ).clicked()
+                ).on_hover_text(label).clicked()
             };
 
             egui::SidePanel::left("main_sidebar")
@@ -6062,6 +6087,17 @@ impl App for VaultGui {
                         egui::Stroke::new(1.0, c_divider),
                     );
                     ui.add_space(12.0);
+
+                    // - - - Reserve space for the fixed footer, and let everything - - -
+                    // - - - above it (nav + filters) scroll independently so long   - - -
+                    // - - - category/tag lists never overflow the sidebar.          - - -
+                    let footer_height = 90.0;
+                    let scroll_max_height = (ui.available_height() - footer_height).max(0.0);
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(scroll_max_height)
+                        .show(ui, |ui| {
 
                     // - - - MAIN NAV - - -
                     ui.label(egui::RichText::new("  VAULT").size(9.5).color(
@@ -6265,12 +6301,9 @@ impl App for VaultGui {
                                 }
                             }
                         }
-                    }
+                    } // - - - end NOTES FILTER block - - -
 
-                    // - - - BOTTOM: push remaining space then show footer actions - - -
-                    let footer_height = 90.0;
-                    let remaining = ui.available_height() - footer_height;
-                    if remaining > 0.0 { ui.add_space(remaining); }
+                    }); // - - - end sidebar_scroll ScrollArea - - -
 
                     ui.painter().hline(
                         ui.available_rect_before_wrap().x_range(),
